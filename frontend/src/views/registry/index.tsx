@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
 import { request } from '@/api/client'
 
@@ -10,79 +10,124 @@ const columns = [
   "服务版本",
   "注册时间",
   "心跳间隔",
+  "最近心跳时间",
   "健康状态",
+  "健康说明",
   "实例标签"
 ]
 const actions = [
   "上线服务",
   "下线服务",
-  "注销服务"
+  "注销服务",
+  "上报心跳"
 ]
-const statuses = [
-  "草稿",
-  "已注册",
-  "已下线",
-  "已注销"
+const filterFields = [
+  { key: 'keyword', label: '实例编号', placeholder: '按实例编号检索' },
+  { key: '服务名称', label: '服务名称', placeholder: '按服务名称过滤' },
+  { key: '服务地址', label: '服务地址', placeholder: '按服务地址过滤' },
+  { key: '服务版本', label: '注册版本', placeholder: '按注册版本定位' },
 ]
-const stats = [
-  {
-    "label": "服务实例总数",
-    "value": 0
-  },
-  {
-    "label": "已注册实例",
-    "value": 0
-  },
-  {
-    "label": "已下线实例",
-    "value": 0
-  }
-]
+const pageSizes = [5, 10, 20, 50]
 
-type Row = Record<string, string | number | null>
+type Row = Record<string, string | number | boolean | null>
+
+type Stats = {
+  total: number
+  registered: number
+  available: number
+  unhealthy: number
+}
+
+const emptyStats: Stats = { total: 0, registered: 0, available: 0, unhealthy: 0 }
+
+function formatCell(column: string, value: Row[string]): string {
+  if (value === null || value === undefined || value === '') return '—'
+  if (column === '心跳间隔') return `${value} 秒`
+  return String(value)
+}
 
 export default function RegistryView() {
   const [rows, setRows] = useState<Row[]>([])
   const [total, setTotal] = useState(0)
+  const [stats, setStats] = useState<Stats>(emptyStats)
   const [errorMessage, setErrorMessage] = useState('')
-  const [filters, setFilters] = useState<Record<string, string>>({})
-  const filterFields = useMemo(() => columns.slice(0, 3), [])
+  const [draft, setDraft] = useState<Record<string, string>>({})
+  const [applied, setApplied] = useState<Record<string, string>>({})
+  const [page, setPage] = useState(1)
+  const [size, setSize] = useState(10)
+
+  const statCards = [
+    { label: '服务实例总数', value: stats.total },
+    { label: '已注册实例', value: stats.registered },
+    { label: '健康可用实例', value: stats.available },
+    { label: '心跳异常实例', value: stats.unhealthy },
+  ]
 
   const reload = useCallback(async () => {
     setErrorMessage('')
-    const query = new URLSearchParams(filters).toString()
+    const query = new URLSearchParams()
+    Object.entries(applied).forEach(([key, value]) => {
+      if (value) query.set(key, value)
+    })
+    query.set('page', String(page))
+    query.set('size', String(size))
     try {
-      const response = await request(`${ENDPOINT}?${query}`)
-      if (!response.ok) {
+      const [listResponse, statsResponse] = await Promise.all([
+        request(`${ENDPOINT}?${query.toString()}`),
+        request(`${ENDPOINT}/stats`),
+      ])
+      if (!listResponse.ok) {
         throw new Error('服务实例列表读取失败')
       }
-      const payload = await response.json()
+      const payload = await listResponse.json()
       setRows(payload.items ?? [])
       setTotal(payload.total ?? 0)
+      if (statsResponse.ok) {
+        setStats(await statsResponse.json())
+      }
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '服务注册发现列表读取失败')
     }
-  }, [filters])
+  }, [applied, page, size])
 
   useEffect(() => {
     void reload()
   }, [reload])
+
+  function applyFilters() {
+    const next: Record<string, string> = {}
+    Object.entries(draft).forEach(([key, value]) => {
+      const trimmed = value.trim()
+      if (trimmed) next[key] = trimmed
+    })
+    setApplied(next)
+    setPage(1)
+  }
+
+  function resetFilters() {
+    setDraft({})
+    setApplied({})
+    setPage(1)
+  }
 
   async function runAction(action: string, row: Row) {
     setErrorMessage('')
     try {
       const response = await request(`${ENDPOINT}/${row.id}/actions`, {
         method: 'POST',
-        body: JSON.stringify({ action }),
+        body: JSON.stringify({ values: { action } }),
       })
-      if (!response.ok) {
-        throw new Error('服务注册发现动作未生效，请稍后重试')
+      const payload = await response.json()
+      if (!response.ok || payload.ok === false) {
+        throw new Error(payload.message ?? payload.detail ?? '服务注册发现动作未生效，请稍后重试')
       }
       await reload()
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '服务注册发现操作失败')
     }
   }
+
+  const pageCount = Math.max(1, Math.ceil(total / size))
 
   return (
     <section className="page" data-module="registry">
@@ -102,7 +147,7 @@ export default function RegistryView() {
       </header>
 
       <div className="stat-row">
-        {stats.map((item) => (
+        {statCards.map((item) => (
           <article key={item.label} className="stat-card">
             <span className="stat-label">{item.label}</span>
             <strong className="stat-value">{item.value}</strong>
@@ -110,19 +155,19 @@ export default function RegistryView() {
         ))}
       </div>
 
-      <form className="filter-bar" onSubmit={(event) => { event.preventDefault(); void reload() }}>
+      <form className="filter-bar" onSubmit={(event) => { event.preventDefault(); applyFilters() }}>
         {filterFields.map((field) => (
-          <label key={field} className="filter-item">
-            <span>{field}</span>
+          <label key={field.key} className="filter-item">
+            <span>{field.label}</span>
             <input
-              value={filters[field] ?? ''}
-              placeholder={`按${field}检索`}
-              onChange={(event) => setFilters((prev) => ({ ...prev, [field]: event.target.value }))}
+              value={draft[field.key] ?? ''}
+              placeholder={field.placeholder}
+              onChange={(event) => setDraft((prev) => ({ ...prev, [field.key]: event.target.value }))}
             />
           </label>
         ))}
         <button className="btn" type="submit">查询</button>
-        <button className="btn ghost" type="button" onClick={() => setFilters({})}>重置条件</button>
+        <button className="btn ghost" type="button" onClick={resetFilters}>重置条件</button>
       </form>
 
       <table className="data-table">
@@ -135,7 +180,7 @@ export default function RegistryView() {
         <tbody>
           {rows.map((row) => (
             <tr key={String(row.id)}>
-              {columns.map((column) => <td key={column}>{row[column] ?? '—'}</td>)}
+              {columns.map((column) => <td key={column}>{formatCell(column, row[column])}</td>)}
               <td className="row-actions">
                 {actions.map((action) => (
                   <button key={action} className="link" type="button" onClick={() => void runAction(action, row)}>
@@ -154,7 +199,24 @@ export default function RegistryView() {
       </table>
 
       <footer className="page-foot">
-        <span>共 {total} 条服务注册发现记录</span>
+        <span>共 {total} 条服务注册发现记录，第 {page} / {pageCount} 页</span>
+        <span className="pager">
+          <label className="filter-item">
+            <span>每页条数</span>
+            <select
+              value={size}
+              onChange={(event) => { setSize(Number(event.target.value)); setPage(1) }}
+            >
+              {pageSizes.map((option) => <option key={option} value={option}>{option}</option>)}
+            </select>
+          </label>
+          <button className="btn" type="button" disabled={page <= 1} onClick={() => setPage((prev) => Math.max(1, prev - 1))}>
+            上一页
+          </button>
+          <button className="btn" type="button" disabled={page >= pageCount} onClick={() => setPage((prev) => prev + 1)}>
+            下一页
+          </button>
+        </span>
         {errorMessage && <span className="error-text">{errorMessage}</span>}
       </footer>
     </section>
